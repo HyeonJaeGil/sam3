@@ -1,0 +1,39 @@
+services:
+  sam3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sam3:cuda12.8
+    working_dir: /workspace/sam3
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace/sam3
+      - type: bind
+        source: /mnt/Backup2nd/Dataset
+        target: /workspace/datasets
+      - type: bind
+        source: /home/hj/.cache/huggingface
+        target: /root/.cache/huggingface
+      - type: bind
+        source: /home/hj/.codex-docker
+        target: /root/.codex
+    tty: true
+    stdin_open: true
+    shm_size: "16gb"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HOME: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+      SAM3_DATASET_DIR: /workspace/datasets
+      CODEX_HOME: /root/.codex
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: /bin/bash
