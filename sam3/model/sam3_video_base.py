@@ -332,6 +332,9 @@ class Sam3VideoBase(nn.Module):
 
             if "multigpu_buffer" not in feature_cache:
                 feature_cache["multigpu_buffer"] = {}
+            multigpu_buffer = feature_cache["multigpu_buffer"].setdefault(
+                text_batch_key, {}
+            )
 
             tracking_bounds = feature_cache.get("tracking_bounds", {})
             max_frame_num_to_track = tracking_bounds.get("max_frame_num_to_track")
@@ -346,7 +349,7 @@ class Sam3VideoBase(nn.Module):
                 geometric_prompt=geometric_prompt,
                 frame_idx=frame_idx,
                 num_frames=num_frames,
-                multigpu_buffer=feature_cache["multigpu_buffer"],
+                multigpu_buffer=multigpu_buffer,
                 track_in_reverse=reverse,
                 return_tracker_backbone_feats=True,
                 run_nms=self.det_nms_thresh > 0.0,
