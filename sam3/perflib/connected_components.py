@@ -4,6 +4,7 @@
 import logging
 
 import torch
+from sam3.perflib.triton_compat import has_c_compiler
 
 try:
     from cc_torch import get_connected_components
@@ -74,7 +75,7 @@ def connected_components(input_tensor: torch.Tensor):
     if input_tensor.is_cuda:
         if HAS_CC_TORCH:
             return get_connected_components(input_tensor.to(torch.uint8))
-        else:
+        elif has_c_compiler():
             # triton fallback
             from sam3.perflib.triton.connected_components import (
                 connected_components_triton,
@@ -82,5 +83,6 @@ def connected_components(input_tensor: torch.Tensor):
 
             return connected_components_triton(input_tensor)
 
-    # CPU fallback
+    # CPU fallback, including environments where Triton cannot JIT due to a
+    # missing system C compiler.
     return connected_components_cpu(input_tensor)

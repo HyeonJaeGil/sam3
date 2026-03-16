@@ -7,6 +7,7 @@ import logging
 import numpy as np
 import torch
 from sam3.perflib.masks_ops import mask_iou
+from sam3.perflib.triton_compat import has_c_compiler
 
 
 try:
@@ -64,7 +65,7 @@ def generic_nms(
     if ious.is_cuda:
         if GENERIC_NMS_AVAILABLE:
             return generic_nms_cuda(ious, scores, iou_threshold, use_iou_matrix=True)
-        else:
+        elif has_c_compiler():
             from sam3.perflib.triton.nms import nms_triton
 
             return nms_triton(ious, scores, iou_threshold)
