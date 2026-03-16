@@ -34,23 +34,33 @@ def load_resource_as_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    frame_start_index: int = 0,
+    max_frames_to_load: int | None = None,
 ):
     """
     Load video frames from either a video or an image (as a single-frame video).
-    Alternatively, if input is a list of PIL images, convert its format
+    Alternatively, if input is a list of PIL images or image paths, convert its format
     """
     if isinstance(resource_path, list):
         img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
         img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
-        assert all(isinstance(img_pil, Image.Image) for img_pil in resource_path)
         assert len(resource_path) is not None
-        orig_height, orig_width = resource_path[0].size
+        if all(isinstance(img_pil, Image.Image) for img_pil in resource_path):
+            pil_images = resource_path
+        elif all(isinstance(img_path, str) for img_path in resource_path):
+            pil_images = [Image.open(img_path).convert("RGB") for img_path in resource_path]
+        else:
+            raise TypeError(
+                "resource_path list entries must be all PIL images or all image paths"
+            )
+        assert len(resource_path) is not None
+        orig_height, orig_width = pil_images[0].size
         orig_height, orig_width = (
             orig_width,
             orig_height,
         )  # For some reason, this method returns these swapped
         images = []
-        for img_pil in resource_path:
+        for img_pil in pil_images:
             img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
             assert img_np.dtype == np.uint8, "np.uint8 is expected for JPEG images"
             img_np = img_np / 255.0
@@ -87,6 +97,8 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            frame_start_index=frame_start_index,
+            max_frames_to_load=max_frames_to_load,
         )
 
 
@@ -121,6 +133,8 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    frame_start_index: int = 0,
+    max_frames_to_load: int | None = None,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -140,6 +154,8 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             async_loading_frames=async_loading_frames,
+            frame_start_index=frame_start_index,
+            max_frames_to_load=max_frames_to_load,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
         return load_video_frames_from_video_file(
@@ -162,6 +178,8 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    frame_start_index=0,
+    max_frames_to_load=None,
 ):
     """
     Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
@@ -183,6 +201,25 @@ def load_video_frames_from_image_folder(
     num_frames = len(frame_names)
     if num_frames == 0:
         raise RuntimeError(f"no images found in {image_folder}")
+    if frame_start_index < 0:
+        raise ValueError(
+            f"frame_start_index must be non-negative, got {frame_start_index}"
+        )
+    if frame_start_index >= num_frames:
+        raise ValueError(
+            f"frame_start_index {frame_start_index} is out of range for {num_frames} frames"
+        )
+    if max_frames_to_load is not None:
+        if max_frames_to_load <= 0:
+            raise ValueError(
+                f"max_frames_to_load must be positive, got {max_frames_to_load}"
+            )
+        frame_names = frame_names[
+            frame_start_index : frame_start_index + max_frames_to_load
+        ]
+    else:
+        frame_names = frame_names[frame_start_index:]
+
     img_paths = [os.path.join(image_folder, frame_name) for frame_name in frame_names]
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]

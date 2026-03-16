@@ -63,6 +63,9 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
+                offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                frame_start_index=request.get("frame_start_index", 0),
+                max_frames_to_load=request.get("max_frames_to_load", None),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -102,7 +105,14 @@ class Sam3VideoPredictor:
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
-    def start_session(self, resource_path, session_id=None):
+    def start_session(
+        self,
+        resource_path,
+        session_id=None,
+        offload_video_to_cpu: bool = False,
+        frame_start_index: int = 0,
+        max_frames_to_load: int | None = None,
+    ):
         """
         Start a new inference session on an image or a video. Here `resource_path`
         can be either a path to an image file (for image inference) or an MP4 file
@@ -115,8 +125,11 @@ class Sam3VideoPredictor:
         # get an initial inference_state from the model
         inference_state = self.model.init_state(
             resource_path=resource_path,
+            offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
+            frame_start_index=frame_start_index,
+            max_frames_to_load=max_frames_to_load,
         )
         if not session_id:
             session_id = str(uuid.uuid4())
