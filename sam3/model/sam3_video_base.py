@@ -320,73 +320,118 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         allow_new_detections: bool,
     ):
-        # Step 1: if text feature is not cached in `feature_cache`, compute and cache it
-        text_batch_key = tuple(input_batch.find_text_batch)
-        if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
-            text_outputs = self.detector.backbone.forward_text(
-                input_batch.find_text_batch, device=self.device
+        def _run_detector_once(text_batch, text_query_idx):
+            text_batch_key = tuple(text_batch)
+            if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
+                text_outputs = self.detector.backbone.forward_text(
+                    text_batch, device=self.device
+                )
+                feature_cache.setdefault("text", {})[text_batch_key] = text_outputs
+            else:
+                text_outputs = feature_cache["text"][text_batch_key]
+
+            if "multigpu_buffer" not in feature_cache:
+                feature_cache["multigpu_buffer"] = {}
+
+            tracking_bounds = feature_cache.get("tracking_bounds", {})
+            max_frame_num_to_track = tracking_bounds.get("max_frame_num_to_track")
+            start_frame_idx = tracking_bounds.get("propagate_in_video_start_frame_idx")
+
+            sam3_image_out, _ = self.detector.forward_video_grounding_multigpu(
+                backbone_out={
+                    "img_batch_all_stages": input_batch.img_batch,
+                    **text_outputs,
+                },
+                find_inputs=input_batch.find_inputs,
+                geometric_prompt=geometric_prompt,
+                frame_idx=frame_idx,
+                num_frames=num_frames,
+                multigpu_buffer=feature_cache["multigpu_buffer"],
+                track_in_reverse=reverse,
+                return_tracker_backbone_feats=True,
+                run_nms=self.det_nms_thresh > 0.0,
+                nms_prob_thresh=self.score_threshold_detection,
+                nms_iou_thresh=self.det_nms_thresh,
+                max_frame_num_to_track=max_frame_num_to_track,
+                propagate_in_video_start_frame_idx=start_frame_idx,
             )
-            # note: we only cache the text feature of the most recent prompt
-            feature_cache["text"] = {text_batch_key: text_outputs}
+            pred_probs = sam3_image_out["pred_logits"].squeeze(-1).sigmoid()
+            if not allow_new_detections:
+                pred_probs = pred_probs - 1e8
+            pred_boxes_xyxy = sam3_image_out["pred_boxes_xyxy"]
+            pred_masks = sam3_image_out["pred_masks"]
+            pos_pred_idx = torch.where(pred_probs > self.score_threshold_detection)
+            query_ids = torch.full(
+                (len(pos_pred_idx[0]),),
+                fill_value=text_query_idx,
+                dtype=torch.int64,
+                device=pred_probs.device,
+            )
+            query_texts = np.full(
+                len(pos_pred_idx[0]),
+                text_batch[0] if text_query_idx >= 0 else None,
+                dtype=object,
+            )
+            return (
+                {
+                    "bbox": pred_boxes_xyxy[pos_pred_idx[0], pos_pred_idx[1]],
+                    "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
+                    "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
+                    "text_query_ids": query_ids,
+                    "text_query_texts": query_texts,
+                },
+                sam3_image_out,
+            )
+
+        text_prompts = feature_cache.get("active_text_prompts", [])
+        aggregated_det_out = None
+        sam3_image_out = None
+
+        if text_prompts:
+            orig_text_batch = list(input_batch.find_text_batch)
+            orig_text_ids = [stage.text_ids.clone() for stage in input_batch.find_inputs]
+            try:
+                for text_query_idx, text_prompt in enumerate(text_prompts):
+                    input_batch.find_text_batch[0] = text_prompt
+                    for stage in input_batch.find_inputs:
+                        stage.text_ids[...] = 0
+                    det_out_this_prompt, sam3_image_out = _run_detector_once(
+                        input_batch.find_text_batch,
+                        text_query_idx,
+                    )
+                    if aggregated_det_out is None:
+                        aggregated_det_out = det_out_this_prompt
+                    else:
+                        for key in ("bbox", "mask", "scores", "text_query_ids"):
+                            aggregated_det_out[key] = torch.cat(
+                                [aggregated_det_out[key], det_out_this_prompt[key]], dim=0
+                            )
+                        aggregated_det_out["text_query_texts"] = np.concatenate(
+                            [
+                                aggregated_det_out["text_query_texts"],
+                                det_out_this_prompt["text_query_texts"],
+                            ],
+                            axis=0,
+                        )
+            finally:
+                input_batch.find_text_batch[:] = orig_text_batch
+                for stage, text_ids in zip(input_batch.find_inputs, orig_text_ids):
+                    stage.text_ids[...] = text_ids
         else:
-            text_outputs = feature_cache["text"][text_batch_key]
+            aggregated_det_out, sam3_image_out = _run_detector_once(
+                input_batch.find_text_batch,
+                -1,
+            )
 
-        # Step 2: run backbone, detector, and post-processing with NMS
-        if "multigpu_buffer" not in feature_cache:
-            # "multigpu_buffer" is a buffer cache used by `self.detector` and it needs
-            # to be passed to `forward_video_grounding_multigpu` for every call
-            feature_cache["multigpu_buffer"] = {}
-
-        # Extract max_frame_num_to_track from feature_cache if available
-        tracking_bounds = feature_cache.get("tracking_bounds", {})
-        max_frame_num_to_track = tracking_bounds.get("max_frame_num_to_track")
-        start_frame_idx = tracking_bounds.get("propagate_in_video_start_frame_idx")
-
-        sam3_image_out, _ = self.detector.forward_video_grounding_multigpu(
-            backbone_out={
-                "img_batch_all_stages": input_batch.img_batch,
-                **text_outputs,
-            },
-            find_inputs=input_batch.find_inputs,
-            geometric_prompt=geometric_prompt,
-            frame_idx=frame_idx,
-            num_frames=num_frames,
-            multigpu_buffer=feature_cache["multigpu_buffer"],
-            track_in_reverse=reverse,
-            # also get the SAM2 backbone features
-            return_tracker_backbone_feats=True,
-            # run NMS as a part of distributed computation
-            run_nms=self.det_nms_thresh > 0.0,
-            nms_prob_thresh=self.score_threshold_detection,
-            nms_iou_thresh=self.det_nms_thresh,
-            # pass max_frame_num_to_track to respect tracking limits
-            max_frame_num_to_track=max_frame_num_to_track,
-            propagate_in_video_start_frame_idx=start_frame_idx,
-        )
-        # note: detections in `sam3_image_out` has already gone through NMS
-        pred_probs = sam3_image_out["pred_logits"].squeeze(-1).sigmoid()
-        if not allow_new_detections:
-            pred_probs = pred_probs - 1e8  # make sure no detections are kept
-        pred_boxes_xyxy = sam3_image_out["pred_boxes_xyxy"]
-        pred_masks = sam3_image_out["pred_masks"]
-        # get the positive detection outputs above threshold
-        pos_pred_idx = torch.where(pred_probs > self.score_threshold_detection)
-        det_out = {
-            "bbox": pred_boxes_xyxy[pos_pred_idx[0], pos_pred_idx[1]],
-            "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
-            "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
-        }
-
-        # Step 3: build SAM2 backbone features and store them in `feature_cache`
         backbone_cache = {}
         sam_mask_decoder = self.tracker.sam_mask_decoder
         tracker_backbone_fpn = [
             sam_mask_decoder.conv_s0(sam3_image_out["tracker_backbone_fpn_0"]),
             sam_mask_decoder.conv_s1(sam3_image_out["tracker_backbone_fpn_1"]),
-            sam3_image_out["tracker_backbone_fpn_2"],  # fpn_2 doesn't need conv
+            sam3_image_out["tracker_backbone_fpn_2"],
         ]
         tracker_backbone_out = {
-            "vision_features": tracker_backbone_fpn[-1],  # top-level feature
+            "vision_features": tracker_backbone_fpn[-1],
             "vision_pos_enc": sam3_image_out["tracker_backbone_pos_enc"],
             "backbone_fpn": tracker_backbone_fpn,
         }
@@ -395,9 +440,8 @@ class Sam3VideoBase(nn.Module):
             input_batch.img_batch[frame_idx],
             backbone_cache,
         )
-        # remove from `feature_cache` old features to save GPU memory
         feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
-        return det_out
+        return aggregated_det_out
 
     def run_tracker_propagation(
         self,
@@ -521,6 +565,12 @@ class Sam3VideoBase(nn.Module):
             "obj_ids_all_gpu": None,  # will be filled later
             "num_obj_per_gpu": deepcopy(tracker_metadata_prev["num_obj_per_gpu"]),
             "obj_id_to_score": deepcopy(tracker_metadata_prev["obj_id_to_score"]),
+            "obj_id_to_text_query_idx": deepcopy(
+                tracker_metadata_prev["obj_id_to_text_query_idx"]
+            ),
+            "obj_id_to_text_query": deepcopy(
+                tracker_metadata_prev["obj_id_to_text_query"]
+            ),
             "obj_id_to_tracker_score_frame_wise": deepcopy(
                 tracker_metadata_prev["obj_id_to_tracker_score_frame_wise"]
             ),
@@ -535,6 +585,8 @@ class Sam3VideoBase(nn.Module):
         det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
         det_scores_np: npt.NDArray = det_out["scores"].float().cpu().numpy()
         det_bbox_xyxy: Tensor = det_out["bbox"]
+        det_query_ids_np: npt.NDArray = det_out["text_query_ids"].cpu().numpy()
+        det_query_texts_np: npt.NDArray = det_out["text_query_texts"]
         if self.rank == 0:
             # a) match detector and tracker masks and find new objects
             (
@@ -548,6 +600,8 @@ class Sam3VideoBase(nn.Module):
                 det_scores_np=det_scores_np,
                 trk_masks=tracker_low_res_masks_global,
                 trk_obj_ids=tracker_metadata_prev["obj_ids_all_gpu"],
+                det_query_ids=det_query_ids_np,
+                trk_obj_id_to_query_idx=tracker_metadata_prev["obj_id_to_text_query_idx"],
             )
             if self.suppress_det_close_to_boundary:
                 keep = self._suppress_detections_close_to_boundary(
@@ -787,6 +841,17 @@ class Sam3VideoBase(nn.Module):
             tracker_metadata_new["obj_id_to_score"].update(
                 zip(new_det_obj_ids, det_scores_np[new_det_fa_inds])
             )
+            tracker_metadata_new["obj_id_to_text_query_idx"].update(
+                zip(new_det_obj_ids, det_query_ids_np[new_det_fa_inds])
+            )
+            tracker_metadata_new["obj_id_to_text_query"].update(
+                {
+                    obj_id: query_text
+                    for obj_id, query_text in zip(
+                        new_det_obj_ids, det_query_texts_np[new_det_fa_inds]
+                    )
+                }
+            )
             # tracker scores are not available for new objects, use det score instead.
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][
                 frame_idx
@@ -802,6 +867,8 @@ class Sam3VideoBase(nn.Module):
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][frame_idx][
                 obj_id
             ] = -1e4
+            tracker_metadata_new["obj_id_to_text_query_idx"].pop(obj_id, None)
+            tracker_metadata_new["obj_id_to_text_query"].pop(obj_id, None)
             tracker_metadata_new["obj_id_to_last_occluded"].pop(obj_id, None)
         # check that "rank0_metadata" is in tracker_metadata_new if and only if it's GPU 0
         assert ("rank0_metadata" in tracker_metadata_new) == (self.rank == 0)
@@ -1164,6 +1231,8 @@ class Sam3VideoBase(nn.Module):
         det_scores_np: npt.NDArray,
         trk_masks: Tensor,
         trk_obj_ids: npt.NDArray,
+        det_query_ids: npt.NDArray | None = None,
+        trk_obj_id_to_query_idx: Dict[int, int] | None = None,
     ):
         """
         Match detections on the current frame with the existing masklets.
@@ -1244,6 +1313,18 @@ class Sam3VideoBase(nn.Module):
         ious = mask_iou(det_masks_binary, trk_masks_binary)  # (N, M)
 
         ious_np = ious.cpu().numpy()
+        if det_query_ids is not None and trk_obj_id_to_query_idx is not None:
+            trk_query_ids = np.array(
+                [trk_obj_id_to_query_idx.get(obj_id, -1) for obj_id in trk_obj_ids],
+                dtype=np.int64,
+            )
+            query_compatible = (
+                (det_query_ids[:, None] < 0)
+                | (trk_query_ids[None, :] < 0)
+                | (det_query_ids[:, None] == trk_query_ids[None, :])
+            )
+            ious_np = np.where(query_compatible, ious_np, 0.0)
+
         if self.o2o_matching_masklets_enable:
             from scipy.optimize import linear_sum_assignment
 
@@ -1607,6 +1688,8 @@ class Sam3VideoBase(nn.Module):
             "num_obj_per_gpu": np.zeros(self.world_size, np.int64),
             "max_obj_id": -1,
             "obj_id_to_score": {},
+            "obj_id_to_text_query_idx": {},
+            "obj_id_to_text_query": {},
             "obj_id_to_tracker_score_frame_wise": defaultdict(dict),
             "obj_id_to_last_occluded": {},
         }

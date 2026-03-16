@@ -4,6 +4,7 @@
 
 import logging
 from collections import defaultdict
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -58,6 +59,8 @@ class Sam3VideoInference(Sam3VideoBase):
         offload_video_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
+        frame_start_index: int = 0,
+        max_frames_to_load: int | None = None,
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
         images, orig_height, orig_width = load_resource_as_video_frames(
@@ -68,6 +71,8 @@ class Sam3VideoInference(Sam3VideoBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            frame_start_index=frame_start_index,
+            max_frames_to_load=max_frames_to_load,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
@@ -93,6 +98,7 @@ class Sam3VideoInference(Sam3VideoBase):
         """Revert `inference_state` to what it was right after initialization."""
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
+        inference_state["text_prompts"] = []
         for t in range(inference_state["num_frames"]):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = 0
             # constructing an output list in inference state (we start with an empty list)
@@ -165,6 +171,7 @@ class Sam3VideoInference(Sam3VideoBase):
         # constructing an output list in inference state (we start with an empty list)
         inference_state["previous_stages_out"] = [None] * num_frames
         inference_state["text_prompt"] = None
+        inference_state["text_prompts"] = []
         inference_state["per_frame_raw_point_input"] = [None] * num_frames
         inference_state["per_frame_raw_box_input"] = [None] * num_frames
         inference_state["per_frame_visual_prompt"] = [None] * num_frames
@@ -363,10 +370,12 @@ class Sam3VideoInference(Sam3VideoBase):
         # prepare inputs
         input_batch = inference_state["input_batch"]
         tracker_states_local = inference_state["tracker_inference_states"]
-        has_text_prompt = inference_state["text_prompt"] is not None
+        text_prompts = inference_state.get("text_prompts", [])
+        has_text_prompt = len(text_prompts) > 0
         has_geometric_prompt = (
             inference_state["per_frame_geometric_prompt"][frame_idx] is not None
         )
+        inference_state["feature_cache"]["active_text_prompts"] = list(text_prompts)
         # run inference for the current frame
         (
             obj_id_to_mask,
@@ -441,6 +450,7 @@ class Sam3VideoInference(Sam3VideoBase):
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
+            out_tracker_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
         else:
@@ -460,6 +470,24 @@ class Sam3VideoInference(Sam3VideoBase):
             )
             out_binary_masks = torch.cat(
                 [obj_id_to_mask[obj_id] for obj_id in curr_obj_ids], dim=0
+            )
+            text_query_indices = np.array(
+                [
+                    inference_state["tracker_metadata"]["obj_id_to_text_query_idx"].get(
+                        obj_id, -1
+                    )
+                    for obj_id in curr_obj_ids
+                ],
+                dtype=np.int64,
+            )
+            text_queries = np.array(
+                [
+                    inference_state["tracker_metadata"]["obj_id_to_text_query"].get(
+                        obj_id, None
+                    )
+                    for obj_id in curr_obj_ids
+                ],
+                dtype=object,
             )
 
             assert out_binary_masks.dtype == torch.bool
@@ -486,6 +514,8 @@ class Sam3VideoInference(Sam3VideoBase):
             out_probs = torch.index_select(out_probs, 0, keep_idx)
             out_tracker_probs = torch.index_select(out_tracker_probs, 0, keep_idx)
             out_binary_masks = torch.index_select(out_binary_masks, 0, keep_idx_gpu)
+            text_query_indices = text_query_indices[keep.numpy()]
+            text_queries = text_queries[keep.numpy()]
 
             if perflib.is_enabled:
                 out_boxes_xyxy = perf_masks_to_boxes(
@@ -515,8 +545,17 @@ class Sam3VideoInference(Sam3VideoBase):
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
+            "out_tracker_probs": out_tracker_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
+            "out_text_query_indices": (
+                text_query_indices
+                if len(curr_obj_ids) > 0
+                else np.zeros(0, dtype=np.int64)
+            ),
+            "out_text_queries": (
+                text_queries if len(curr_obj_ids) > 0 else np.zeros(0, dtype=object)
+            ),
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
@@ -782,9 +821,11 @@ class Sam3VideoInference(Sam3VideoBase):
             {
                 "obj_ids_per_gpu": [np.arange(num_objects)],
                 "obj_ids_all_gpu": np.arange(num_objects),  # Same as 1 GPU
-                "num_obj_per_gpu": [num_objects],
+                "num_obj_per_gpu": np.array([num_objects], dtype=np.int64),
                 "obj_id_to_score": {i: 1.0 for i in range(num_objects)},
-                "max_obj_id": num_objects,
+                "obj_id_to_text_query_idx": {i: -1 for i in range(num_objects)},
+                "obj_id_to_text_query": {i: None for i in range(num_objects)},
+                "max_obj_id": num_objects - 1,
                 "rank0_metadata": {
                     "masklet_confirmation": {
                         "status": np.zeros(num_objects, dtype=np.int64),
@@ -855,9 +896,6 @@ class Sam3VideoInference(Sam3VideoBase):
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
         num_frames = inference_state["num_frames"]
-        assert text_str is not None or boxes_xywh is not None, (
-            "at least one type of prompt (text, boxes) must be provided"
-        )
         assert 0 <= frame_idx < num_frames, (
             f"{frame_idx=} is out of range for a total of {num_frames} frames"
         )
@@ -866,9 +904,18 @@ class Sam3VideoInference(Sam3VideoBase):
         self.reset_state(inference_state)
 
         # 1) add text prompt
-        if text_str is not None and text_str != "visual":
-            inference_state["text_prompt"] = text_str
-            inference_state["input_batch"].find_text_batch[0] = text_str
+        text_prompts = self._normalize_text_prompts(text_str)
+        assert len(text_prompts) > 0 or boxes_xywh is not None, (
+            "at least one type of prompt (text, boxes) must be provided"
+        )
+        inference_state["text_prompts"] = text_prompts
+        if len(text_prompts) == 1:
+            inference_state["text_prompt"] = text_prompts[0]
+            inference_state["input_batch"].find_text_batch[0] = text_prompts[0]
+            text_id = self.TEXT_ID_FOR_TEXT
+        elif len(text_prompts) > 1:
+            inference_state["text_prompt"] = None
+            inference_state["input_batch"].find_text_batch[0] = text_prompts[0]
             text_id = self.TEXT_ID_FOR_TEXT
         else:
             inference_state["text_prompt"] = None
@@ -905,6 +952,29 @@ class Sam3VideoInference(Sam3VideoBase):
             inference_state, frame_idx, reverse=False
         )
         return frame_idx, self._postprocess_output(inference_state, out)
+
+    @staticmethod
+    def _normalize_text_prompts(text_str):
+        if text_str is None:
+            return []
+        if isinstance(text_str, str):
+            stripped = text_str.strip()
+            if stripped == "" or stripped == "visual":
+                return []
+            return [stripped]
+        if isinstance(text_str, Sequence):
+            prompts = []
+            for item in text_str:
+                if item is None:
+                    continue
+                if not isinstance(item, str):
+                    raise TypeError("text prompts must be strings")
+                stripped = item.strip()
+                if stripped == "" or stripped == "visual":
+                    continue
+                prompts.append(stripped)
+            return prompts
+        raise TypeError("text prompt must be a string or a sequence of strings")
 
     @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
@@ -1305,6 +1375,8 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             tracker_metadata["obj_ids_per_gpu"]
         )
         tracker_metadata["obj_id_to_score"].pop(obj_id, None)
+        tracker_metadata["obj_id_to_text_query_idx"].pop(obj_id, None)
+        tracker_metadata["obj_id_to_text_query"].pop(obj_id, None)
         # tracker_metadata["max_obj_id"] # we do not reuse the object id, so we do not update it here
 
         # Clean up cached frame outputs to remove references to the deleted object
