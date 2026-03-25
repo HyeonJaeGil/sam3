@@ -359,8 +359,6 @@ class Sam3VideoBase(nn.Module):
                 propagate_in_video_start_frame_idx=start_frame_idx,
             )
             pred_probs = sam3_image_out["pred_logits"].squeeze(-1).sigmoid()
-            if not allow_new_detections:
-                pred_probs = pred_probs - 1e8
             pred_boxes_xyxy = sam3_image_out["pred_boxes_xyxy"]
             pred_masks = sam3_image_out["pred_masks"]
             pos_pred_idx = torch.where(pred_probs > self.score_threshold_detection)
@@ -444,6 +442,7 @@ class Sam3VideoBase(nn.Module):
             backbone_cache,
         )
         feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+        aggregated_det_out["allow_new_detections"] = allow_new_detections
         return aggregated_det_out
 
     def run_tracker_propagation(
@@ -590,6 +589,7 @@ class Sam3VideoBase(nn.Module):
         det_bbox_xyxy: Tensor = det_out["bbox"]
         det_query_ids_np: npt.NDArray = det_out["text_query_ids"].cpu().numpy()
         det_query_texts_np: npt.NDArray = det_out["text_query_texts"]
+        allow_new_detections = det_out.get("allow_new_detections", True)
         if self.rank == 0:
             # a) match detector and tracker masks and find new objects
             (
@@ -606,6 +606,8 @@ class Sam3VideoBase(nn.Module):
                 det_query_ids=det_query_ids_np,
                 trk_obj_id_to_query_idx=tracker_metadata_prev["obj_id_to_text_query_idx"],
             )
+            if not allow_new_detections:
+                new_det_fa_inds = np.array([], np.int64)
             if self.suppress_det_close_to_boundary:
                 keep = self._suppress_detections_close_to_boundary(
                     det_bbox_xyxy[new_det_fa_inds]

@@ -66,6 +66,7 @@ class Sam3VideoPredictor:
                 offload_video_to_cpu=request.get("offload_video_to_cpu", False),
                 frame_start_index=request.get("frame_start_index", 0),
                 max_frames_to_load=request.get("max_frames_to_load", None),
+                allow_new_detections=request.get("allow_new_detections", None),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -112,6 +113,7 @@ class Sam3VideoPredictor:
         offload_video_to_cpu: bool = False,
         frame_start_index: int = 0,
         max_frames_to_load: int | None = None,
+        allow_new_detections: bool | None = None,
     ):
         """
         Start a new inference session on an image or a video. Here `resource_path`
@@ -130,6 +132,7 @@ class Sam3VideoPredictor:
             video_loader_type=self.video_loader_type,
             frame_start_index=frame_start_index,
             max_frames_to_load=max_frames_to_load,
+            allow_new_detections=allow_new_detections,
         )
         if not session_id:
             session_id = str(uuid.uuid4())

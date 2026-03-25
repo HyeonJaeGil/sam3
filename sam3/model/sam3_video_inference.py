@@ -61,6 +61,7 @@ class Sam3VideoInference(Sam3VideoBase):
         video_loader_type="cv2",
         frame_start_index: int = 0,
         max_frames_to_load: int | None = None,
+        allow_new_detections: bool | None = None,
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
         images, orig_height, orig_width = load_resource_as_video_frames(
@@ -91,6 +92,7 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["allow_new_detections_override"] = allow_new_detections
         return inference_state
 
     @torch.inference_mode()
@@ -280,11 +282,14 @@ class Sam3VideoInference(Sam3VideoBase):
             reverse=reverse,
         )
 
-        # Store max_frame_num_to_track in feature_cache for downstream methods
+        # Store propagation-specific metadata in feature_cache for downstream methods
         inference_state["feature_cache"]["tracking_bounds"] = {
             "max_frame_num_to_track": max_frame_num_to_track,
             "propagate_in_video_start_frame_idx": start_frame_idx,
         }
+        inference_state["feature_cache"]["allow_new_detections_override"] = (
+            inference_state.get("allow_new_detections_override", None)
+        )
 
         hotstart_buffer = []
         hotstart_removed_obj_ids = set()
@@ -294,73 +299,78 @@ class Sam3VideoInference(Sam3VideoBase):
         # e.g., we output an object on frame 4 only if it becomes confirmed on frame 6.
         unconfirmed_status_delay = self.masklet_confirmation_consecutive_det_thresh - 1
         unconfirmed_obj_ids_per_frame = {}  # frame_idx -> hidden_obj_ids
-        for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
-        ):
-            out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
+        try:
+            for frame_idx in tqdm(
+                processing_order, desc="propagate_in_video", disable=self.rank > 0
+            ):
+                out = self._run_single_frame_inference(
+                    inference_state, frame_idx, reverse
+                )
 
-            if self.hotstart_delay > 0:
-                # accumulate the outputs for the first `hotstart_delay` frames
-                hotstart_buffer.append([frame_idx, out])
-                # update the object IDs removed by hotstart so that we don't output them
-                if self.rank == 0:
-                    hotstart_removed_obj_ids.update(out["removed_obj_ids"])
-                    unconfirmed_obj_ids = out.get("unconfirmed_obj_ids", None)
-                    if unconfirmed_obj_ids is not None:
-                        unconfirmed_obj_ids_per_frame[frame_idx] = unconfirmed_obj_ids
+                if self.hotstart_delay > 0:
+                    # accumulate the outputs for the first `hotstart_delay` frames
+                    hotstart_buffer.append([frame_idx, out])
+                    # update the object IDs removed by hotstart so that we don't output them
+                    if self.rank == 0:
+                        hotstart_removed_obj_ids.update(out["removed_obj_ids"])
+                        unconfirmed_obj_ids = out.get("unconfirmed_obj_ids", None)
+                        if unconfirmed_obj_ids is not None:
+                            unconfirmed_obj_ids_per_frame[frame_idx] = unconfirmed_obj_ids
 
-                if frame_idx == end_frame_idx:
-                    # we reached the end of propagation -- yield all frames in the buffer
-                    yield_list = hotstart_buffer
-                    hotstart_buffer = []
-                elif len(hotstart_buffer) >= self.hotstart_delay:
-                    # we have enough frames -- yield and remove the first (oldest) frame from the buffer
-                    yield_list = hotstart_buffer[:1]
-                    hotstart_buffer = hotstart_buffer[1:]
+                    if frame_idx == end_frame_idx:
+                        # we reached the end of propagation -- yield all frames in the buffer
+                        yield_list = hotstart_buffer
+                        hotstart_buffer = []
+                    elif len(hotstart_buffer) >= self.hotstart_delay:
+                        # we have enough frames -- yield and remove the first (oldest) frame from the buffer
+                        yield_list = hotstart_buffer[:1]
+                        hotstart_buffer = hotstart_buffer[1:]
+                    else:
+                        # not enough frames yet -- skip yielding
+                        yield_list = []
                 else:
-                    # not enough frames yet -- skip yielding
-                    yield_list = []
-            else:
-                yield_list = [(frame_idx, out)]  # output the current frame
+                    yield_list = [(frame_idx, out)]  # output the current frame
 
-            for yield_frame_idx, yield_out in yield_list:
-                # post-process the output and yield it
-                if self.rank == 0:
-                    suppressed_obj_ids = yield_out["suppressed_obj_ids"]
-                    unconfirmed_status_frame_idx = (
-                        yield_frame_idx + unconfirmed_status_delay
-                        if not reverse
-                        else yield_frame_idx - unconfirmed_status_delay
-                    )
+                for yield_frame_idx, yield_out in yield_list:
+                    # post-process the output and yield it
+                    if self.rank == 0:
+                        suppressed_obj_ids = yield_out["suppressed_obj_ids"]
+                        unconfirmed_status_frame_idx = (
+                            yield_frame_idx + unconfirmed_status_delay
+                            if not reverse
+                            else yield_frame_idx - unconfirmed_status_delay
+                        )
 
-                    # Clamp the frame index to stay within video bounds
-                    num_frames = inference_state["num_frames"]
-                    unconfirmed_status_frame_idx = max(
-                        0, min(unconfirmed_status_frame_idx, num_frames - 1)
-                    )
+                        # Clamp the frame index to stay within video bounds
+                        num_frames = inference_state["num_frames"]
+                        unconfirmed_status_frame_idx = max(
+                            0, min(unconfirmed_status_frame_idx, num_frames - 1)
+                        )
 
-                    unconfirmed_obj_ids = unconfirmed_obj_ids_per_frame.get(
-                        unconfirmed_status_frame_idx, None
-                    )
-                    postprocessed_out = self._postprocess_output(
-                        inference_state,
-                        yield_out,
-                        hotstart_removed_obj_ids,
-                        suppressed_obj_ids,
-                        unconfirmed_obj_ids,
-                    )
+                        unconfirmed_obj_ids = unconfirmed_obj_ids_per_frame.get(
+                            unconfirmed_status_frame_idx, None
+                        )
+                        postprocessed_out = self._postprocess_output(
+                            inference_state,
+                            yield_out,
+                            hotstart_removed_obj_ids,
+                            suppressed_obj_ids,
+                            unconfirmed_obj_ids,
+                        )
 
-                    self._cache_frame_outputs(
-                        inference_state,
-                        yield_frame_idx,
-                        yield_out["obj_id_to_mask"],
-                        suppressed_obj_ids=suppressed_obj_ids,
-                        removed_obj_ids=hotstart_removed_obj_ids,
-                        unconfirmed_obj_ids=unconfirmed_obj_ids,
-                    )
-                else:
-                    postprocessed_out = None  # no output on other GPUs
-                yield yield_frame_idx, postprocessed_out
+                        self._cache_frame_outputs(
+                            inference_state,
+                            yield_frame_idx,
+                            yield_out["obj_id_to_mask"],
+                            suppressed_obj_ids=suppressed_obj_ids,
+                            removed_obj_ids=hotstart_removed_obj_ids,
+                            unconfirmed_obj_ids=unconfirmed_obj_ids,
+                        )
+                    else:
+                        postprocessed_out = None  # no output on other GPUs
+                    yield yield_frame_idx, postprocessed_out
+        finally:
+            inference_state["feature_cache"].pop("allow_new_detections_override", None)
 
     def _run_single_frame_inference(self, inference_state, frame_idx, reverse):
         """
@@ -377,6 +387,9 @@ class Sam3VideoInference(Sam3VideoBase):
         )
         inference_state["feature_cache"]["active_text_prompts"] = list(text_prompts)
         # run inference for the current frame
+        allow_new_detections_override = inference_state["feature_cache"].get(
+            "allow_new_detections_override", None
+        )
         (
             obj_id_to_mask,
             obj_id_to_score,
@@ -400,7 +413,11 @@ class Sam3VideoInference(Sam3VideoBase):
             orig_vid_height=inference_state["orig_height"],
             orig_vid_width=inference_state["orig_width"],
             is_image_only=inference_state["is_image_only"],
-            allow_new_detections=has_text_prompt or has_geometric_prompt,
+            allow_new_detections=(
+                has_text_prompt or has_geometric_prompt
+                if allow_new_detections_override is None
+                else allow_new_detections_override
+            ),
         )
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new
