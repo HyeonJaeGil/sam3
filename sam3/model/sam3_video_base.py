@@ -385,14 +385,21 @@ class Sam3VideoBase(nn.Module):
             )
 
         text_prompts = feature_cache.get("active_text_prompts", [])
+        text_query_ids = feature_cache.get("active_text_query_ids", None)
         aggregated_det_out = None
         sam3_image_out = None
 
         if text_prompts:
+            if text_query_ids is None:
+                text_query_ids = list(range(len(text_prompts)))
+            elif len(text_query_ids) != len(text_prompts):
+                raise ValueError(
+                    "active_text_query_ids must match active_text_prompts in length"
+                )
             orig_text_batch = list(input_batch.find_text_batch)
             orig_text_ids = [stage.text_ids.clone() for stage in input_batch.find_inputs]
             try:
-                for text_query_idx, text_prompt in enumerate(text_prompts):
+                for text_query_idx, text_prompt in zip(text_query_ids, text_prompts):
                     input_batch.find_text_batch[0] = text_prompt
                     for stage in input_batch.find_inputs:
                         stage.text_ids[...] = 0
