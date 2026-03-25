@@ -8,6 +8,7 @@ from collections import OrderedDict
 import torch
 from sam3.model.sam3_tracker_base import concat_points, NO_OBJ_SCORE, Sam3TrackerBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
+from sam3.model.utils.misc import copy_data_to_device
 from sam3.model.utils.sam2_utils import load_video_frames
 from tqdm.auto import tqdm
 
@@ -1027,6 +1028,11 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 # Cache the most recent frame's feature (for repeated interactions with
                 # a frame; we can use an LRU cache for more frames in the future).
                 inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+        elif isinstance(image, torch.Tensor) and image.device != self.device:
+            image, backbone_out = copy_data_to_device(
+                (image, backbone_out), self.device, non_blocking=True
+            )
+            inference_state["cached_features"][frame_idx] = (image, backbone_out)
         if "tracker_backbone_out" in backbone_out:
             backbone_out = backbone_out["tracker_backbone_out"]  # get backbone output
 

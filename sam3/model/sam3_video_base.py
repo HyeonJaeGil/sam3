@@ -22,6 +22,7 @@ from sam3.model.box_ops import fast_diag_box_iou
 from sam3.model.data_misc import BatchedDatapoint
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores, mask_to_box
 from sam3.perflib.masks_ops import mask_iou
+from sam3.model.utils.misc import copy_data_to_device
 from sam3.train.masks_ops import rle_encode
 from torch import nn, Tensor
 
@@ -247,6 +248,7 @@ class Sam3VideoBase(nn.Module):
             orig_vid_height=orig_vid_height,
             orig_vid_width=orig_vid_width,
             feature_cache=feature_cache,
+            offload_state_to_cpu=feature_cache.get("offload_state_to_cpu", False),
         )
 
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
@@ -320,15 +322,27 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         allow_new_detections: bool,
     ):
+        offload_state_to_cpu = feature_cache.get("offload_state_to_cpu", False)
+
         def _run_detector_once(text_batch, text_query_idx):
             text_batch_key = tuple(text_batch)
             if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
                 text_outputs = self.detector.backbone.forward_text(
                     text_batch, device=self.device
                 )
-                feature_cache.setdefault("text", {})[text_batch_key] = text_outputs
+                if offload_state_to_cpu:
+                    text_outputs_to_cache = copy_data_to_device(
+                        text_outputs, torch.device("cpu"), non_blocking=True
+                    )
+                else:
+                    text_outputs_to_cache = text_outputs
+                feature_cache.setdefault("text", {})[text_batch_key] = text_outputs_to_cache
             else:
                 text_outputs = feature_cache["text"][text_batch_key]
+                if offload_state_to_cpu:
+                    text_outputs = copy_data_to_device(
+                        text_outputs, self.device, non_blocking=True
+                    )
 
             if "multigpu_buffer" not in feature_cache:
                 feature_cache["multigpu_buffer"] = {}
@@ -357,6 +371,7 @@ class Sam3VideoBase(nn.Module):
                 nms_iou_thresh=self.det_nms_thresh,
                 max_frame_num_to_track=max_frame_num_to_track,
                 propagate_in_video_start_frame_idx=start_frame_idx,
+                offload_multigpu_buffer_to_cpu=offload_state_to_cpu,
             )
             pred_probs = sam3_image_out["pred_logits"].squeeze(-1).sigmoid()
             pred_boxes_xyxy = sam3_image_out["pred_boxes_xyxy"]
@@ -444,10 +459,12 @@ class Sam3VideoBase(nn.Module):
             "backbone_fpn": tracker_backbone_fpn,
         }
         backbone_cache["tracker_backbone_out"] = tracker_backbone_out
-        feature_cache[frame_idx] = (
-            input_batch.img_batch[frame_idx],
-            backbone_cache,
-        )
+        frame_cache_entry = (input_batch.img_batch[frame_idx], backbone_cache)
+        if offload_state_to_cpu:
+            frame_cache_entry = copy_data_to_device(
+                frame_cache_entry, torch.device("cpu"), non_blocking=True
+            )
+        feature_cache[frame_idx] = frame_cache_entry
         feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
         aggregated_det_out["allow_new_detections"] = allow_new_detections
         return aggregated_det_out
@@ -980,6 +997,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        offload_state_to_cpu: bool = False,
     ):
         # initialize tracking scores with detection scores
         new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
@@ -1004,6 +1022,7 @@ class Sam3VideoBase(nn.Module):
                 orig_vid_height=orig_vid_height,
                 orig_vid_width=orig_vid_width,
                 feature_cache=feature_cache,
+                offload_state_to_cpu=offload_state_to_cpu,
             )
 
         # Step 2: remove from SAM2 inference states those objects removed by heuristics
@@ -1617,6 +1636,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        offload_state_to_cpu: bool = False,
     ):
         """Add a new object to SAM2 inference states."""
         prev_tracker_state = (
@@ -1631,6 +1651,7 @@ class Sam3VideoBase(nn.Module):
             video_height=orig_vid_height,
             video_width=orig_vid_width,
             num_frames=num_frames,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         new_tracker_state["backbone_out"] = (
             prev_tracker_state.get("backbone_out", None)

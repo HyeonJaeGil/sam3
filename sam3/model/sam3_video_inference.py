@@ -57,6 +57,7 @@ class Sam3VideoInference(Sam3VideoBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
         frame_start_index: int = 0,
@@ -89,9 +90,11 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["tracker_inference_states"] = []
         inference_state["tracker_metadata"] = {}
         inference_state["feature_cache"] = {}
+        inference_state["feature_cache"]["offload_state_to_cpu"] = offload_state_to_cpu
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         inference_state["allow_new_detections_override"] = allow_new_detections
         return inference_state
 
@@ -115,7 +118,9 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["visual_prompt_mask"] = None
         inference_state["tracker_inference_states"].clear()
         inference_state["tracker_metadata"].clear()
+        offload_state_to_cpu = inference_state.get("offload_state_to_cpu", False)
         inference_state["feature_cache"].clear()
+        inference_state["feature_cache"]["offload_state_to_cpu"] = offload_state_to_cpu
         inference_state["cached_frame_outputs"].clear()
         inference_state["action_history"].clear()  # for logging user actions
 
@@ -602,6 +607,12 @@ class Sam3VideoInference(Sam3VideoBase):
                 if obj_id in filtered_obj_id_to_mask:
                     del filtered_obj_id_to_mask[obj_id]
 
+        if inference_state.get("offload_state_to_cpu", False):
+            filtered_obj_id_to_mask = copy_data_to_device(
+                filtered_obj_id_to_mask,
+                torch.device("cpu"),
+                non_blocking=True,
+            )
         inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
 
     def _build_tracker_output(
@@ -614,6 +625,12 @@ class Sam3VideoInference(Sam3VideoBase):
             "No cached outputs found. Ensure normal propagation has run first to populate the cache."
         )
         cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
+        if inference_state.get("offload_state_to_cpu", False):
+            cached_outputs = copy_data_to_device(
+                cached_outputs,
+                self.device,
+                non_blocking=True,
+            )
 
         obj_id_to_mask = cached_outputs.copy()
 
@@ -1077,6 +1094,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
     @torch.inference_mode()

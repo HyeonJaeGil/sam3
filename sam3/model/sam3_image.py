@@ -18,6 +18,7 @@ from .act_ckpt_utils import activation_ckpt_wrapper
 from .box_ops import box_cxcywh_to_xyxy
 from .geometry_encoders import Prompt
 from .model_misc import inverse_sigmoid
+from .utils.misc import copy_data_to_device
 
 
 def _update_out(out, out_name, out_value, auxiliary=True, update_aux=True):
@@ -717,6 +718,9 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         Compute the detector's detection outputs in a distributed manner, where all GPUs process
         a chunk of frames (equal to the number of GPUs) at once and store them in cache.
         """
+        offload_multigpu_buffer_to_cpu = kwargs.get(
+            "offload_multigpu_buffer_to_cpu", False
+        )
         # Step 1: fetch the detector outputs in the current chunk from buffer
         frame_idx_curr_b = frame_idx - frame_idx % self.world_size
         frame_idx_curr_e = min(frame_idx_curr_b + self.world_size, num_frames)
@@ -735,6 +739,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                     run_nms=run_nms,
                     nms_prob_thresh=nms_prob_thresh,
                     nms_iou_thresh=nms_iou_thresh,
+                    offload_multigpu_buffer_to_cpu=offload_multigpu_buffer_to_cpu,
                 )
 
         # read out the current frame's results from `multigpu_buffer`
@@ -744,6 +749,13 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                 continue
             if handle is not None:
                 handle.wait()  # wait for async all-gather to finish
+            if offload_multigpu_buffer_to_cpu and isinstance(v, torch.Tensor):
+                if v.device.type == "cpu":
+                    v = v.to(self.device, non_blocking=True)
+                multigpu_buffer[frame_idx][k] = (
+                    copy_data_to_device(v, torch.device("cpu"), non_blocking=True),
+                    None,
+                )
             out[k] = v
 
         # Step 2: remove detection outputs of the previous chunk from cache to save GPU memory
@@ -782,6 +794,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                     run_nms=run_nms,
                     nms_prob_thresh=nms_prob_thresh,
                     nms_iou_thresh=nms_iou_thresh,
+                    offload_multigpu_buffer_to_cpu=offload_multigpu_buffer_to_cpu,
                 )
 
         return out, backbone_out
@@ -798,6 +811,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         run_nms=False,
         nms_prob_thresh=None,
         nms_iou_thresh=None,
+        offload_multigpu_buffer_to_cpu=False,
     ):
         """Compute detection outputs on a chunk of frames and store their results in multigpu_buffer."""
         # each GPU computes detections on one frame in the chunk (in a round-robin manner)
@@ -864,6 +878,18 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                 frame_buffer["tracker_backbone_fpn_1"] = (fpn1[rank], fpn_handle1)
                 frame_buffer["tracker_backbone_fpn_2"] = (fpn2[rank], fpn_handle2)
                 frame_buffer["tracker_backbone_pos_enc"] = (vision_pos_enc, None)
+
+            if offload_multigpu_buffer_to_cpu:
+                offloaded_frame_buffer = {}
+                for key, (value, handle) in frame_buffer.items():
+                    if handle is not None:
+                        handle.wait()
+                    if isinstance(value, torch.Tensor):
+                        value = copy_data_to_device(
+                            value, torch.device("cpu"), non_blocking=True
+                        )
+                    offloaded_frame_buffer[key] = (value, None)
+                frame_buffer = offloaded_frame_buffer
 
             multigpu_buffer[frame_idx_to_save] = frame_buffer
 

@@ -64,6 +64,7 @@ class Sam3VideoPredictor:
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
                 offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                offload_state_to_cpu=request.get("offload_state_to_cpu", False),
                 frame_start_index=request.get("frame_start_index", 0),
                 max_frames_to_load=request.get("max_frames_to_load", None),
                 allow_new_detections=request.get("allow_new_detections", None),
@@ -111,6 +112,7 @@ class Sam3VideoPredictor:
         resource_path,
         session_id=None,
         offload_video_to_cpu: bool = False,
+        offload_state_to_cpu: bool = False,
         frame_start_index: int = 0,
         max_frames_to_load: int | None = None,
         allow_new_detections: bool | None = None,
@@ -128,6 +130,7 @@ class Sam3VideoPredictor:
         inference_state = self.model.init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
             frame_start_index=frame_start_index,
