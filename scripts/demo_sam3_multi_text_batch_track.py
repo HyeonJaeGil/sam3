@@ -15,13 +15,25 @@ try:
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
         "The demo requires the `supervision` package. Install it before running "
-        "this script, for example with `pip install supervision`."
+        "this script, for example with `pip install -e \".[notebooks]\"`."
     ) from exc
 
 from sam3.model_builder import build_sam3_video_predictor
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
+
+def parse_text_queries(values: list[str]) -> list[str]:
+    queries = []
+    for value in values:
+        for item in value.split(","):
+            query = item.strip()
+            if query:
+                queries.append(query)
+    if not queries:
+        raise ValueError("at least one non-empty text query must be provided")
+    return queries
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,9 +55,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--text-query",
-        action="append",
+        nargs="+",
         required=True,
-        help="Text query to detect and track. Repeat for multiple queries.",
+        help="One or more text queries to detect and track.",
     )
     parser.add_argument(
         "--frame-index",
@@ -105,6 +117,20 @@ def parse_args() -> argparse.Namespace:
             "--frame-stride > 1, the dense window spans enough frames to produce "
             "--max-frames sampled frames."
         ),
+    )
+    allow_new_detections_group = parser.add_mutually_exclusive_group()
+    allow_new_detections_group.add_argument(
+        "--allow-new-detections",
+        dest="allow_new_detections",
+        action="store_true",
+        default=None,
+        help="Force detector-side new detections to stay enabled during propagation.",
+    )
+    allow_new_detections_group.add_argument(
+        "--no-allow-new-detections",
+        dest="allow_new_detections",
+        action="store_false",
+        help="Disable detector-side new detections during propagation.",
     )
     return parser.parse_args()
 
@@ -212,11 +238,14 @@ def save_outputs(
     propagated_results: Iterable[dict],
     output_dir: Path,
     mask_alpha: float,
+    skip_frame_indices: set[int] | None = None,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
     for result in propagated_results:
         frame_idx = int(result["frame_index"])
+        if skip_frame_indices is not None and frame_idx in skip_frame_indices:
+            continue
         outputs = result["outputs"]
         if frame_idx < 0 or frame_idx >= len(frame_paths):
             continue
@@ -228,8 +257,26 @@ def save_outputs(
     return saved
 
 
+def save_single_output(
+    frame_paths: list[Path],
+    frame_idx: int,
+    outputs: dict,
+    output_dir: Path,
+    mask_alpha: float,
+) -> int:
+    if frame_idx < 0 or frame_idx >= len(frame_paths):
+        return 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_size = Image.open(frame_paths[frame_idx]).size
+    log_outputs(f"Frame {frame_idx} detections:", outputs, image_size)
+    annotated = annotate_frame(frame_paths[frame_idx], outputs, mask_alpha)
+    annotated.save(output_dir / frame_paths[frame_idx].name)
+    return 1
+
+
 def main() -> None:
     args = parse_args()
+    args.text_query = parse_text_queries(args.text_query)
     frame_paths = list_frames(args.input_image_dir)
 
     if args.frame_index < 0 or args.frame_index >= len(frame_paths):
@@ -259,6 +306,8 @@ def main() -> None:
         "resource_path": str(args.input_image_dir),
         "offload_video_to_cpu": args.offload_video_to_cpu,
     }
+    if args.allow_new_detections is not None:
+        start_request["allow_new_detections"] = args.allow_new_detections
     max_dense_end = min(
         len(frame_paths),
         args.frame_index + (args.max_frames - 1) * args.frame_stride + 1,
@@ -301,6 +350,14 @@ def main() -> None:
             prompt_image_size,
         )
 
+        saved = save_single_output(
+            frame_paths=selected_frame_paths,
+            frame_idx=prompt_frame_index,
+            outputs=prompt_response["outputs"],
+            output_dir=args.output_dir,
+            mask_alpha=args.mask_alpha,
+        )
+
         stream = predictor.handle_stream_request(
             request={
                 "type": "propagate_in_video",
@@ -310,11 +367,16 @@ def main() -> None:
                 "max_frame_num_to_track": max_frame_num_to_track,
             }
         )
-        saved = save_outputs(
+        saved += save_outputs(
             frame_paths=selected_frame_paths,
             propagated_results=stream,
             output_dir=args.output_dir,
             mask_alpha=args.mask_alpha,
+            skip_frame_indices=(
+                {prompt_frame_index}
+                if args.allow_new_detections is False
+                else None
+            ),
         )
         print(
             f"Saved {saved} annotated frame(s) to {args.output_dir} "
